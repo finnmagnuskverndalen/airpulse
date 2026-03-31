@@ -11,8 +11,33 @@ mod llm;
 
 pub use aggregator::Packet;
 
+fn run_setup() {
+    let status = std::process::Command::new("python3")
+        .arg("setup.py")
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(_) => { eprintln!("setup exited with error"); std::process::exit(1); }
+        Err(e) => { eprintln!("could not run setup.py: {}", e); std::process::exit(1); }
+    }
+}
+
+fn needs_setup() -> bool {
+    if !std::path::Path::new(".env").exists() {
+        return true;
+    }
+    dotenv().ok();
+    let key = std::env::var("OPENROUTER_API_KEY").unwrap_or_default();
+    key.is_empty() || key == "your-key-here"
+}
+
 #[tokio::main]
 async fn main() {
+    if needs_setup() {
+        println!("\n  no .env found — running setup first\n");
+        run_setup();
+    }
+
     dotenv().ok();
     tracing_subscriber::fmt::init();
 
