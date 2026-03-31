@@ -1,0 +1,6 @@
+.env
+target/
+data/oui.csv
+*.bin
+*.elf
+build/
