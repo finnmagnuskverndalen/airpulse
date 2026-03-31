@@ -208,6 +208,24 @@ function update(data) {
   });
   feed.innerHTML = rows.join('');
 
+  // analyst panel
+  if (data.analysis && data.analysis !== document.getElementById('analyst-text').dataset.last) {
+    document.getElementById('analyst-text').dataset.last = data.analysis;
+    const el = document.getElementById('analyst-text');
+    el.innerHTML = '';
+    let i = 0;
+    const cursor = '<span class="cursor"></span>';
+    const interval = setInterval(() => {
+      if (i <= data.analysis.length) {
+        el.innerHTML = data.analysis.slice(0, i) + cursor;
+        i++;
+      } else {
+        el.innerHTML = data.analysis;
+        clearInterval(interval);
+      }
+    }, 18);
+  }
+
   // device table
   const tbody = document.getElementById('device-table');
   tbody.innerHTML = data.devices

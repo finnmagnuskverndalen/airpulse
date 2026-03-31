@@ -42,6 +42,7 @@ pub struct BroadcastMsg {
     pub events: Vec<String>,
     pub alerts: Vec<Alert>,
     pub stats: Stats,
+    pub analysis: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -78,12 +79,16 @@ pub async fn run(
     let start = Instant::now();
     let mut last_broadcast = Instant::now();
     let mut last_pps_time = Instant::now();
+    let mut last_llm = Instant::now();
+    let llm_interval = std::env::var("LLM_INTERVAL_SECS")
+        .unwrap_or("30".into()).parse::<u64>().unwrap_or(30);
+    let mut current_analysis = String::from("Waiting for data...");
+    let mut pending_analysis: Option<tokio::task::JoinHandle<String>> = None;
 
     loop {
         tokio::select! {
             Some(pkt) = pkt_rx.recv() => {
                 total_packets += 1;
-
                 let is_new = !devices.contains_key(&pkt.mac);
                 let manufacturer = crate::oui::lookup(&oui_db, &pkt.mac);
 
@@ -99,9 +104,14 @@ pub async fn run(
                         probed_ssids: HashSet::new(),
                         deauth_times: VecDeque::new(),
                     });
-                    let msg = format!("new device: {} ({})", manufacturer, pkt.mac);
+                    let msg = format!("new device: {} ({})", manufacturer, &pkt.mac[..8]);
                     events.push_front(msg);
                     if events.len() > 50 { events.pop_back(); }
+                    alerts.push(Alert {
+                        severity: "INFO".into(),
+                        message: format!("new device: {}", manufacturer),
+                        mac: Some(pkt.mac.clone()),
+                    });
                 }
 
                 if let Some(mut dev) = devices.get_mut(&pkt.mac) {
@@ -109,37 +119,76 @@ pub async fn run(
                     dev.rssi = pkt.rssi;
                     dev.last_seen = Instant::now();
 
-                    // deauth burst detection
                     if pkt.frame_type == "deauth" {
                         dev.deauth_times.push_back(Instant::now());
-                        // keep only last 5s
                         while dev.deauth_times.front()
                             .map(|t| t.elapsed() > Duration::from_secs(2))
                             .unwrap_or(false) {
                             dev.deauth_times.pop_front();
                         }
-                        if dev.deauth_times.len() >= 5 {
+                        if dev.deauth_times.len() >= 5 && !dev.flagged {
                             dev.flagged = true;
                             alerts.push(Alert {
                                 severity: "HIGH".into(),
                                 message: format!("deauth burst: {} frames in 2s", dev.deauth_times.len()),
                                 mac: Some(pkt.mac.clone()),
                             });
-                            let msg = format!("DEAUTH burst from {}", pkt.mac);
-                            events.push_front(msg);
+                            events.push_front(format!("DEAUTH burst from {}", &pkt.mac[..8]));
                         }
                     }
                 }
 
-                // track edges
                 let bcast_mac = "ff:ff:ff:ff:ff:ff".to_string();
                 if pkt.dst != bcast_mac {
                     let key = (pkt.mac.clone(), pkt.dst.clone());
                     *edges.entry(key).or_insert(0) += 1;
                 }
             }
-
             _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+        }
+
+        // check if LLM task finished
+        if let Some(ref mut handle) = pending_analysis {
+            if handle.is_finished() {
+                if let Ok(result) = pending_analysis.take().unwrap().await {
+                    if !result.is_empty() {
+                        current_analysis = result;
+                        tracing::info!("LLM analysis updated");
+                    }
+                }
+                pending_analysis = None;
+            }
+        }
+
+        // fire LLM every N seconds
+        if last_llm.elapsed() >= Duration::from_secs(llm_interval) && pending_analysis.is_none() {
+            last_llm = Instant::now();
+            let dev_count = devices.len();
+            let new_count = devices.iter().filter(|e| e.last_seen.elapsed() < Duration::from_secs(llm_interval)).count();
+            let deauth_count = alerts.iter().filter(|a| a.severity == "HIGH").count();
+            let top: Vec<String> = {
+                let mut v: Vec<_> = devices.iter()
+                    .map(|e| (e.manufacturer.clone(), e.frame_count))
+                    .collect();
+                v.sort_by(|a,b| b.1.cmp(&a.1));
+                v.iter().take(5).map(|(m,c)| format!("{} ({})", m, c)).collect()
+            };
+
+            let summary = format!(
+                "Devices seen: {} ({} new in last {}s)
+Total packets: {}
+Packets/sec: {}
+Deauth alerts: {}
+Top talkers: {}
+Recent events: {}",
+                dev_count, new_count, llm_interval,
+                total_packets, pps, deauth_count,
+                top.join(", "),
+                events.iter().take(5).cloned().collect::<Vec<_>>().join("; ")
+            );
+
+            tracing::info!("firing LLM analysis");
+            pending_analysis = Some(tokio::spawn(crate::llm::analyze(summary)));
         }
 
         // pps counter
@@ -181,13 +230,13 @@ pub async fn run(
                     device_count: devices.len(),
                     uptime_secs: start.elapsed().as_secs(),
                 },
+                analysis: current_analysis.clone(),
             };
 
             if let Ok(json) = serde_json::to_string(&msg) {
                 let _ = bcast_tx.send(json);
             }
 
-            // keep only last 20 alerts
             if alerts.len() > 20 { alerts.drain(0..alerts.len()-20); }
         }
     }
