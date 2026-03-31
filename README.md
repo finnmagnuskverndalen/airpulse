@@ -1,66 +1,27 @@
 # airpulse
 
-Real-time WiFi packet intelligence dashboard. An M5StickC runs in promiscuous mode capturing every 802.11 frame flying through the air, streams metadata to a Rust backend over WebSocket, and fires it to an LLM every 30 seconds for plain-English analysis. A browser dashboard renders a live force-directed graph of every device talking to every other device on your network.
+Real-time WiFi packet intelligence. The M5StickC runs in promiscuous mode, captures 802.11 frames, fingerprints devices by OS, and serves a live dashboard directly from the device — no laptop, no backend, no cloud.
 
-![dashboard mockup](https://raw.githubusercontent.com/finnmagnuskverndalen/airpulse/master/static/preview.png)
+Open `http://<device-ip>` from any browser on the same network.
 
 ---
 
 ## what it does
 
 - captures all 802.11 frames in range — probes, beacons, data, deauth, management
-- identifies device manufacturers from MAC addresses (39k+ OUI entries, fully offline)
-- detects anomalies in real-time: deauth bursts, SSID harvesting, silent watchers
-- streams LLM analysis every 30 seconds — plain English, no bullet points
-- renders a live force-directed graph of every device and connection
-- zero cloud dependencies — everything runs on your laptop
-
----
-
-## architecture
-
-```
-M5StickC (ESP32-PICO-D4)
-  Core 1 — WiFi promiscuous callback (IRAM, interrupt-driven)
-  Core 0 — drain ring buffer → serialize JSON → WebSocket TX
-      │
-      │  ws://laptop:8766/esp
-      ▼
-Rust backend (Tokio + axum)
-  bridge.rs      — accept M5StickC connection, deserialize packets
-  aggregator.rs  — DashMap device state, anomaly rules, 1s broadcast
-  oui.rs         — offline MAC → manufacturer lookup
-  llm.rs         — OpenRouter streaming client, 30s summaries
-  broadcaster.rs — fan-out state to all browser WebSocket clients
-      │
-      │  ws://localhost:8765/ws
-      ▼
-Browser dashboard
-  D3.js force-directed graph — live node/edge updates
-  sidebar — live feed, anomaly alerts, LLM typewriter analysis
-  device table — click any row to highlight its node
-```
-
----
-
-## stack
-
-| layer | choice | why |
-|---|---|---|
-| firmware | Arduino C++ | bare metal, IRAM callbacks, dual-core — ~10x faster than MicroPython |
-| backend | Rust + Tokio | async, zero-cost abstractions, handles 10k+ packets/sec |
-| http + ws | axum | built on Tokio, serves frontend + WebSocket on same port |
-| device state | dashmap | lock-free concurrent hashmap, no mutex on hot path |
-| packet fan-out | tokio::sync::broadcast | push to all browser clients simultaneously |
-| frontend | D3.js + vanilla JS | force-directed graph, no framework overhead |
+- identifies device OS from probe request information elements (Apple, Windows, Android, Linux)
+- detects randomized/private MAC addresses
+- tracks which SSIDs each device is probing for
+- flags deauth anomalies in real-time
+- serves a live dashboard over WebSocket from the device itself
 
 ---
 
 ## hardware
 
-- **M5StickC** — ESP32-PICO-D4, full promiscuous mode support
-- USB-C to laptop — no battery required
-- Tested on Debian 13
+- **M5StickC** (ESP32-PICO-D4) — WiFi radio in promiscuous mode
+- USB-C power — wall charger, powerbank, or laptop
+- Any browser on the same WiFi network to view the dashboard
 
 ---
 
@@ -73,142 +34,122 @@ git clone https://github.com/finnmagnuskverndalen/airpulse
 cd airpulse
 ```
 
-### 2. install dependencies
+### 2. install tools
 
 ```bash
-# Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source $HOME/.cargo/env
-
 # Arduino CLI
 curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh
 export PATH=$PATH:$HOME/bin
 
-# ESP32 board support (use 2.0.14 — newer versions break M5StickC)
+# ESP32 board support (2.0.14 — newer versions break M5StickC library)
 arduino-cli config add board_manager.additional_urls \
   https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
 arduino-cli core install esp32:esp32@2.0.14
-arduino-cli lib install "WebSockets" "ArduinoJson"
 
-# Serial port access
+# Required libraries
+arduino-cli lib install "WebSockets" "ArduinoJson" "ESPAsyncWebServer" "AsyncTCP"
+
+# Serial port access (Linux)
 sudo usermod -aG dialout $USER && newgrp dialout
 ```
 
-### 3. OUI database
+### 3. configure
 
-```bash
-curl -L -o /tmp/oui.txt "https://standards-oui.ieee.org/oui/oui.txt"
-python3 - << 'EOF'
-with open("/tmp/oui.txt") as f:
-    lines = f.readlines()
-out = ["mac_prefix,vendor_name\n"]
-for line in lines:
-    if "(hex)" in line:
-        parts = line.split("(hex)")
-        if len(parts) == 2:
-            mac = parts[0].strip().replace("-","").lower()
-            vendor = parts[1].strip().strip('"')
-            out.append(f"{mac},{vendor}\n")
-with open("data/oui.csv","w") as f:
-    f.writelines(out)
-print(f"loaded {len(out)-1} entries")
-EOF
+Edit `firmware/standalone/standalone.ino` and set your WiFi credentials at the top:
+
+```cpp
+#define WIFI_SSID  "your-network"
+#define WIFI_PASS  "your-password"
 ```
 
-### 4. firmware
+### 4. compile and flash
 
 ```bash
-# Edit firmware/recon/recon.ino and set:
-#   WIFI_SSID  — your WiFi network name
-#   WIFI_PASS  — your WiFi password
-#   SERVER_IP  — your laptop IP (run: ip route get 1 | awk '{print $7; exit}')
+# Compile
+arduino-cli compile --fqbn esp32:esp32:m5stick-c \
+  --build-path /tmp/airpulse_build \
+  firmware/standalone
 
-arduino-cli compile --fqbn esp32:esp32:m5stick-c firmware/recon
-arduino-cli upload --fqbn esp32:esp32:m5stick-c --port /dev/ttyUSB0 firmware/recon
+# Flash (use sudo chmod 666 /dev/ttyUSB0 if permission denied)
+arduino-cli upload --fqbn esp32:esp32:m5stick-c \
+  --port /dev/ttyUSB0 \
+  --input-dir /tmp/airpulse_build \
+  firmware/standalone
 ```
 
-### 5. environment
+### 5. find the device IP
 
 ```bash
-cp .env.example .env
-nano .env   # set OPENROUTER_API_KEY
+sudo nmap -sn 192.168.1.0/24 | grep -i espressif
 ```
 
-### 6. run
+Or check your router's connected devices list for a device named `esp32-xxxxxx`.
 
-```bash
-cargo run --release
+### 6. open the dashboard
+
+```
+http://<device-ip>
 ```
 
-Open `http://localhost:8765`
-
----
-
-## environment variables
-
-| variable | default | description |
-|---|---|---|
-| `OPENROUTER_API_KEY` | — | required for LLM analysis |
-| `SERVER_HOST` | `0.0.0.0` | backend bind address |
-| `SERVER_PORT` | `8765` | browser WebSocket + HTTP port |
-| `ESP_WS_PORT` | `8766` | M5StickC WebSocket port |
-| `OUI_CSV_PATH` | `data/oui.csv` | offline OUI database path |
-| `LLM_MODEL` | `deepseek/deepseek-chat-v3-0324:free` | OpenRouter model |
-| `LLM_INTERVAL_SECS` | `30` | seconds between LLM summaries |
-
----
-
-## anomaly detection
-
-| rule | trigger | severity |
-|---|---|---|
-| deauth burst | >5 deauth frames in 2s from same MAC | HIGH |
-| ssid harvest | same MAC probing >3 different SSIDs | MEDIUM |
-| new device | MAC not seen before | INFO |
-| silent watcher | strong RSSI, zero data frames | LOW |
+Works from any device — phone, tablet, laptop — on the same WiFi network.
 
 ---
 
 ## dashboard
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│  ◉ AIRPULSE  ● LIVE   14 devices   320/s   uptime 4m        │
-├──────────────────────────────────────┬───────────────────────┤
-│                                      │  AI ANALYST           │
-│                                      │  "3 new devices..."   │
-│   D3.js force-directed graph         │                       │
-│   nodes = devices                    │  ALERTS               │
-│   edges = observed traffic           │  ⚑ deauth burst       │
-│   size  = frame count                │  ⚑ new RPi            │
-│   color = device type                │                       │
-│                                      │  LIVE FEED            │
-│                                      │  probe → HomeNet      │
-│                                      │  deauth !! aa:bb:cc   │
-├──────────────────────────────────────┴───────────────────────┤
-│  MAC  │  Manufacturer  │  Type  │  RSSI  │  Frames  │  Age  │
-└──────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│  AIRPULSE  ● LIVE   14 devices   342/s   48,291 total       │
+├──────────────────────────────────────┬──────────────────────┤
+│  MAC              OS   SSID   RSSI   │  Apple               │
+│  aa:bb:cc:...  ● Apple  Home  -55   │  f8:4d:89:aa:cc:01   │
+│  dc:a6:32:...  ● Linux   —    -62   │                       │
+│  f8:32:e4:...  ● Win   Corp  -71   │  OS        Apple      │
+│  b4:e6:2d:...  ● Andr  Home  -78   │  RSSI      -55 dBm    │
+│  ...                                 │  FRAMES    412        │
+│                                      │  PROBED    HomeNet    │
+│                                      │  MAC TYPE  permanent  │
+│                                      │                       │
+│                                      │  RECENT EVENTS        │
+│                                      │  NEW Apple device     │
+│                                      │  PROBE "HomeNet"      │
+├──────────────────────────────────────┴──────────────────────┤
+│  STANDALONE MODE  ·  UPTIME 4m  ·  ● Apple  ● Win  ● Andr  │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-**node colors:** blue = router · green = phone/laptop · amber = IoT · red = unknown/flagged
-
-**node size:** scales with frame count — heavy talkers are bigger
-
-**red outline:** device flagged by anomaly detector
+Click any row to inspect the device. The right panel shows OS fingerprint, signal strength, frame count, probed SSID, MAC type, and a live event feed filtered to that device.
 
 ---
 
-## known issues
+## OS fingerprinting
 
-- M5StickC display is non-functional due to AXP192 power management chip incompatibility with ESP32 Arduino core 2.x. The device captures and streams packets correctly — all data is visible in the browser dashboard. Hardware fix: short G0 to GND on boot to force download mode, then flash a patched firmware.
-- OUI database is not included in the repo. Run the setup step above to download it (~39k entries from IEEE).
+Passive only — reads probe request information elements broadcast by devices when scanning for networks. No payload capture, no traffic interception.
+
+| OS | Detection method |
+|---|---|
+| Apple | Vendor IE `00:17:f2` in probe requests |
+| Windows | Vendor IE `00:50:f2` (Microsoft) in probe requests |
+| Android | HT capabilities + extended rates + 8+ supported rates |
+| Linux | Basic rates only, no vendor IE, no HT |
+| Randomized MAC | Locally administered bit set `(mac[0] & 0x02) != 0` |
+
+---
+
+## channel hopping
+
+The device automatically cycles through channels 1, 6, and 11 every 2 seconds, covering the three non-overlapping 2.4GHz channels used by most devices.
+
+---
+
+## notes
+
+- The M5StickC display is non-functional due to AXP192 power management chip incompatibility with ESP32 Arduino core 2.x. Everything works headlessly over WiFi.
+- This tool is for use on networks you own or have permission to monitor. Passive 802.11 frame capture is legal in most jurisdictions when used on your own airspace.
+- No payload data is captured — only frame headers (MAC addresses, frame types, signal strength, probe request IEs).
 
 ---
 
 ## license
 
-MIT — do whatever you want with it.
-
----
-
-*built in one session with an M5StickC, a Debian laptop, and too much stubbornness*
+MIT

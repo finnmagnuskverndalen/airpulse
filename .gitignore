@@ -4,3 +4,8 @@ data/oui.csv
 *.bin
 *.elf
 build/
+src/
+static/
+Cargo.toml
+Cargo.lock
+setup.py
