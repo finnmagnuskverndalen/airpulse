@@ -140,7 +140,7 @@ void bcast_task(void* p){
 }
 
 const char* getHTML(){
-  static char buf[12000];
+  static char* buf = NULL; if(!buf) buf = (char*)malloc(12000); if(!buf) return "<h1>OOM</h1>";
   strcpy(buf,"<!DOCTYPE html><html lang=en><head><meta charset=UTF-8><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>airpulse</title>");
   strcat(buf,"<link href=\"https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400&display=swap\" rel=stylesheet>");
   strcat(buf,"<style>*{box-sizing:border-box;margin:0;padding:0}:root{--bg:#000;--b1:#1a1a1a;--b2:#222;--g:#00ff88;--r:#ff3355;--b:#4488ff;--a:#ffaa00}html,body{height:100%;overflow:hidden;background:#000}body{font-family:'JetBrains Mono',monospace;font-size:11px;color:#fff;display:grid;grid-template-rows:40px 1fr 36px;height:100vh}");
