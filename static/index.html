@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>airpulse</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0a0a0f;color:#e0e0e0;font-family:'JetBrains Mono',monospace,sans-serif;font-size:12px;overflow:hidden;height:100vh}
+#topbar{height:40px;background:#0f0f1a;border-bottom:1px solid #1e2030;display:flex;align-items:center;padding:0 16px;gap:20px}
+.logo{font-size:14px;font-weight:700;color:#7dd3fc;letter-spacing:0.15em}
+.live-dot{width:7px;height:7px;border-radius:50%;background:#22c55e;animation:pulse 1.4s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.3}}
+.stat{color:#94a3b8;font-size:11px}.stat b{color:#e2e8f0}
+#main{display:grid;grid-template-columns:1fr 240px;height:calc(100vh - 40px - 120px)}
+#graph{position:relative;overflow:hidden}
+#sidebar{border-left:1px solid #1e2030;display:flex;flex-direction:column;overflow:hidden}
+.panel{padding:10px 12px;border-bottom:1px solid #1e2030;flex-shrink:0}
+.panel-title{font-size:9px;letter-spacing:0.12em;color:#475569;margin-bottom:8px;font-weight:600}
+#analyst-text{font-size:11px;line-height:1.6;color:#94a3b8;min-height:48px}
+.cursor{display:inline-block;width:2px;height:11px;background:#7dd3fc;animation:blink 0.9s step-end infinite;vertical-align:middle}
+@keyframes blink{50%{opacity:0}}
+.alert{display:flex;gap:6px;padding:4px 0;border-bottom:1px solid #1a1f2e;align-items:flex-start}
+.alert:last-child{border-bottom:none}
+.badge{font-size:9px;padding:2px 5px;border-radius:3px;font-weight:700;white-space:nowrap;flex-shrink:0}
+.HIGH{background:#450a0a;color:#f87171}
+.MEDIUM{background:#431407;color:#fb923c}
+.LOW,.INFO,.NEW{background:#052e16;color:#4ade80}
+.alert-msg{font-size:10px;color:#64748b;line-height:1.4}
+#feed{flex:1;overflow-y:auto;padding:8px 12px}
+.feed-row{display:flex;gap:6px;padding:3px 0;border-bottom:1px solid #0f1118}
+.feed-ts{color:#334155;white-space:nowrap;font-size:10px;padding-top:1px}
+.feed-msg{color:#64748b;font-size:10px;line-height:1.4}
+.tag{font-size:9px;padding:1px 4px;border-radius:2px;font-weight:600}
+.t-probe{background:#431407;color:#fb923c}
+.t-data{background:#0c1a3a;color:#60a5fa}
+.t-deauth{background:#450a0a;color:#f87171}
+.t-new{background:#052e16;color:#4ade80}
+.t-beacon{background:#1a0a2e;color:#a78bfa}
+#bottom{height:120px;border-top:1px solid #1e2030;overflow:auto;background:#080810}
+table{width:100%;border-collapse:collapse;font-size:11px}
+thead th{padding:6px 12px;text-align:left;font-size:9px;font-weight:600;letter-spacing:0.08em;color:#334155;border-bottom:1px solid #1e2030;background:#080810;position:sticky;top:0}
+tbody tr{border-bottom:1px solid #0f1118;cursor:pointer;transition:background 0.1s}
+tbody tr:hover{background:#0f1520}
+tbody tr.flagged{background:#1a0505}
+td{padding:4px 12px;color:#64748b}
+.mac{font-family:monospace;color:#94a3b8}
+.mfr{color:#e2e8f0}
+.type-dot{width:6px;height:6px;border-radius:50%;display:inline-block;margin-right:4px}
+.rssi-bar{height:3px;border-radius:2px;display:inline-block;vertical-align:middle}
+svg text{pointer-events:none}
+.node circle{cursor:pointer}
+.node circle.flagged-ring{stroke:#ef4444;stroke-width:2}
+</style>
+</head>
+<body>
+<div id="topbar">
+  <span class="logo">◉ AIRPULSE</span>
+  <span><span class="live-dot" id="conn-dot"></span></span>
+  <span class="stat"><b id="stat-dev">0</b> devices</span>
+  <span class="stat"><b id="stat-pps">0</b>/s</span>
+  <span class="stat"><b id="stat-pkts">0</b> total</span>
+  <span class="stat">up <b id="stat-up">0s</b></span>
+</div>
+
+<div id="main">
+  <div id="graph"></div>
+  <div id="sidebar">
+    <div class="panel">
+      <div class="panel-title">AI ANALYST</div>
+      <div id="analyst-text">waiting for data...<span class="cursor"></span></div>
+    </div>
+    <div class="panel" id="alert-panel">
+      <div class="panel-title">ALERTS</div>
+      <div id="alerts"></div>
+    </div>
+    <div class="panel-title" style="padding:8px 12px 4px">LIVE FEED</div>
+    <div id="feed"></div>
+  </div>
+</div>
+
+<div id="bottom">
+  <table>
+    <thead>
+      <tr>
+        <th>MAC</th><th>Manufacturer</th><th>Type</th>
+        <th>RSSI</th><th>Frames</th><th>Last seen</th><th></th>
+      </tr>
+    </thead>
+    <tbody id="device-table"></tbody>
+  </table>
+</div>
+
+<script>
+const W = () => document.getElementById('graph').clientWidth;
+const H = () => document.getElementById('graph').clientHeight;
+
+const svg = d3.select('#graph').append('svg')
+  .attr('width', '100%').attr('height', '100%');
+
+const g = svg.append('g');
+
+svg.call(d3.zoom().scaleExtent([0.3, 4])
+  .on('zoom', e => g.attr('transform', e.transform)));
+
+const sim = d3.forceSimulation()
+  .force('link', d3.forceLink().id(d => d.id).distance(80).strength(0.3))
+  .force('charge', d3.forceManyBody().strength(-200))
+  .force('center', d3.forceCenter(W()/2, H()/2))
+  .force('collision', d3.forceCollide(30));
+
+let linkSel = g.append('g').selectAll('line');
+let nodeSel = g.append('g').selectAll('.node');
+
+const nodeColor = t => ({
+  'Router':'#3b82f6','Phone':'#22c55e','Laptop':'#14b8a6',
+  'IoT':'#f59e0b','Unknown':'#ef4444'
+}[t] || '#ef4444');
+
+const nodeRadius = d => Math.max(8, Math.min(28, 8 + Math.log2(d.frame_count+1)*2.5));
+
+let nodes = [], links = [], selectedMac = null;
+
+function update(data) {
+  const devMap = {};
+  data.devices.forEach(d => devMap[d.mac] = d);
+
+  // merge nodes
+  const existing = new Map(nodes.map(n => [n.id, n]));
+  nodes = data.devices.map(d => {
+    const ex = existing.get(d.mac);
+    return ex ? Object.assign(ex, d, {id: d.mac}) : {...d, id: d.mac};
+  });
+
+  // build links from edges
+  const nodeSet = new Set(nodes.map(n => n.id));
+  links = data.edges
+    .filter(([s,t]) => nodeSet.has(s) && nodeSet.has(t))
+    .slice(0, 200)
+    .map(([s,t,v]) => ({source: s, target: t, value: v}));
+
+  sim.nodes(nodes);
+  sim.force('link').links(links);
+  sim.alpha(0.1).restart();
+
+  linkSel = linkSel.data(links, d => d.source.id+'-'+d.target.id)
+    .join('line')
+    .attr('stroke', '#1e2a3a')
+    .attr('stroke-width', d => Math.min(4, 0.5 + Math.log2(d.value+1)*0.5));
+
+  nodeSel = nodeSel.data(nodes, d => d.id)
+    .join(enter => {
+      const ng = enter.append('g').attr('class','node')
+        .call(d3.drag()
+          .on('start', (e,d) => { if(!e.active) sim.alphaTarget(0.3).restart(); d.fx=d.x; d.fy=d.y; })
+          .on('drag',  (e,d) => { d.fx=e.x; d.fy=e.y; })
+          .on('end',   (e,d) => { if(!e.active) sim.alphaTarget(0); d.fx=null; d.fy=null; }))
+        .on('click', (e,d) => {
+          selectedMac = d.mac;
+          highlightDevice(d.mac);
+        });
+      ng.append('circle');
+      ng.append('text').attr('text-anchor','middle').attr('dy','0.35em')
+        .style('font-size','9px').style('fill','#94a3b8');
+      return ng;
+    });
+
+  nodeSel.select('circle')
+    .attr('r', d => nodeRadius(d))
+    .attr('fill', d => nodeColor(d.device_type)+'22')
+    .attr('stroke', d => nodeColor(d.device_type))
+    .attr('stroke-width', d => d.flagged ? 2.5 : 1)
+    .attr('class', d => d.flagged ? 'flagged-ring' : '');
+
+  nodeSel.select('text')
+    .text(d => d.manufacturer === 'Unknown' ? d.mac.slice(-5) : d.manufacturer.slice(0,10));
+
+  sim.on('tick', () => {
+    linkSel
+      .attr('x1', d => d.source.x).attr('y1', d => d.source.y)
+      .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
+    nodeSel.attr('transform', d => `translate(${d.x},${d.y})`);
+  });
+
+  // stats
+  const s = data.stats;
+  document.getElementById('stat-dev').textContent = s.device_count;
+  document.getElementById('stat-pps').textContent = s.packets_per_sec;
+  document.getElementById('stat-pkts').textContent = s.total_packets.toLocaleString();
+  document.getElementById('stat-up').textContent = s.uptime_secs + 's';
+
+  // alerts
+  const alertEl = document.getElementById('alerts');
+  alertEl.innerHTML = data.alerts.slice(-5).reverse().map(a =>
+    `<div class="alert"><span class="badge ${a.severity}">${a.severity}</span><span class="alert-msg">${a.message}${a.mac ? ' — '+a.mac.slice(-8) : ''}</span></div>`
+  ).join('');
+
+  // events feed
+  const feed = document.getElementById('feed');
+  const rows = data.events.slice(0,30).map(e => {
+    let tag = 'new', cls = 't-new';
+    if(e.includes('deauth')||e.includes('DEAUTH')){tag='deauth';cls='t-deauth';}
+    else if(e.includes('probe')){tag='probe';cls='t-probe';}
+    else if(e.includes('data')){tag='data';cls='t-data';}
+    const ts = new Date().toTimeString().slice(0,8);
+    return `<div class="feed-row"><span class="feed-ts">${ts}</span><span class="feed-msg"><span class="tag ${cls}">${tag}</span> ${e}</span></div>`;
+  });
+  feed.innerHTML = rows.join('');
+
+  // device table
+  const tbody = document.getElementById('device-table');
+  tbody.innerHTML = data.devices
+    .sort((a,b) => b.frame_count - a.frame_count)
+    .slice(0,50)
+    .map(d => {
+      const rssiPct = Math.min(100, Math.max(0, (d.rssi+100)*2));
+      const rssiColor = d.rssi > -60 ? '#22c55e' : d.rssi > -75 ? '#f59e0b' : '#ef4444';
+      return `<tr class="${d.flagged?'flagged':''}" onclick="highlightDevice('${d.mac}')">
+        <td class="mac">${d.mac}</td>
+        <td class="mfr">${d.manufacturer}</td>
+        <td><span class="type-dot" style="background:${nodeColor(d.device_type)}"></span>${d.device_type}</td>
+        <td><span class="rssi-bar" style="width:${rssiPct*0.4}px;background:${rssiColor}"></span> ${d.rssi}</td>
+        <td>${d.frame_count.toLocaleString()}</td>
+        <td>${d.last_seen}s ago</td>
+        <td>${d.flagged?'⚑':''}</td>
+      </tr>`;
+    }).join('');
+}
+
+function highlightDevice(mac) {
+  nodeSel.select('circle')
+    .attr('stroke-width', d => d.mac === mac ? 4 : (d.flagged ? 2.5 : 1))
+    .attr('r', d => d.mac === mac ? nodeRadius(d)*1.4 : nodeRadius(d));
+  document.querySelectorAll('#device-table tr').forEach(tr => {
+    tr.style.background = tr.onclick?.toString().includes(mac) ? '#0f2040' : '';
+  });
+}
+
+// WebSocket
+const dot = document.getElementById('conn-dot');
+function connect() {
+  const ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onopen = () => { dot.style.background='#22c55e'; };
+  ws.onclose = () => { dot.style.background='#ef4444'; setTimeout(connect, 2000); };
+  ws.onmessage = e => {
+    try { update(JSON.parse(e.data)); } catch(err) { console.error(err); }
+  };
+}
+connect();
+</script>
+</body>
+</html>
